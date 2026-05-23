@@ -1,384 +1,207 @@
 #!/usr/bin/env python3
 import os
-import sys
 import subprocess
-import socket
-import glob
+import sys
 
-def safe_read(path, mode='r'):
-    """Безопасное чтение с обработкой ошибок"""
+def run_cmd(cmd, description, shell=True):
+    """Запускает команду и выводит результат"""
+    print(f"\n[*] {description}")
+    print(f"    Command: {cmd}")
+    print("-" * 60)
     try:
-        with open(path, mode) as f:
-            return f.read()
-    except (PermissionError, FileNotFoundError, IOError):
-        return None
-
-def check_container_type():
-    """Определяем тип контейнера"""
-    print("[*] Checking container type...")
-    
-    # Docker
-    if os.path.exists('/.dockerenv'):
-        print("[+] Docker container detected")
-    
-    # Kubernetes
-    if os.path.exists('/var/run/secrets/kubernetes.io'):
-        print("[+] Kubernetes pod detected")
-    
-    # Check cgroups (доступно без рута)
-    cgroups = safe_read('/proc/self/cgroup')
-    if cgroups:
-        if 'docker' in cgroups:
-            print("[+] Docker detected via cgroups")
-        if 'kubepods' in cgroups:
-            print("[+] Kubernetes detected via cgroups")
-        if 'lxc' in cgroups:
-            print("[+] LXC detected via cgroups")
-
-def check_user_context():
-    """Проверяем контекст пользователя"""
-    print("\n[*] User context:")
-    print(f"    UID: {os.getuid()}")
-    print(f"    GID: {os.getgid()}")
-    print(f"    EUID: {os.geteuid()}")
-    print(f"    Groups: {os.getgroups()}")
-    
-    # Проверяем принадлежность к интересным группам
-    try:
-        import grp
-        for gid in os.getgroups():
-            try:
-                group = grp.getgrgid(gid)
-                if group.gr_name in ['docker', 'root', 'wheel', 'sudo', 'disk', 'video']:
-                    print(f"    [+] Member of interesting group: {group.gr_name}")
-            except:
-                pass
-    except:
-        pass
-
-def check_capabilities():
-    """Проверяем capabilities (доступно без рута)"""
-    print("\n[*] Checking capabilities...")
-    
-    status = safe_read('/proc/self/status')
-    if status:
-        for line in status.split('\n'):
-            if 'Cap' in line:
-                print(f"    {line.strip()}")
-    else:
-        print("[-] Cannot read /proc/self/status")
-
-def check_mounts():
-    """Анализируем mount points"""
-    print("\n[*] Checking mounts...")
-    
-    mounts = safe_read('/proc/self/mounts')
-    if not mounts:
-        mounts = safe_read('/proc/mounts')
-    
-    if mounts:
-        interesting = []
-        for mount in mounts.split('\n'):
-            if not mount.strip():
-                continue
-            
-            parts = mount.split()
-            if len(parts) < 2:
-                continue
-            
-            mountpoint = parts[1]
-            
-            # Ищем интересные монтирования
-            if any(x in mountpoint for x in ['/host', '/proc', '/sys', '/dev', 
-                                             '/var/run/docker.sock', '/run/docker.sock',
-                                             'docker.sock', '/etc/hosts', '/etc/hostname']):
-                interesting.append(mount.strip())
+        result = subprocess.run(
+            cmd,
+            shell=shell,
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
         
-        if interesting:
-            print("[+] Interesting mounts found:")
-            for m in interesting:
-                print(f"    {m}")
-        else:
-            print("[-] No obviously interesting mounts")
-    else:
-        print("[-] Cannot read mounts")
-
-def check_filesystem_access():
-    """Проверяем доступ к критичным путям"""
-    print("\n[*] Checking filesystem access...")
-    
-    paths_to_check = [
-        '/var/run/docker.sock',
-        '/run/docker.sock',
-        '/host',
-        '/host/etc',
-        '/host/var/run/docker.sock',
-        '/proc/sys',
-        '/sys/fs/cgroup',
-        '/sys/kernel',
-        '/dev',
-        '/.dockerenv',
-        '/etc/docker',
-        '/var/lib/docker'
-    ]
-    
-    for path in paths_to_check:
-        if os.path.exists(path):
-            readable = os.access(path, os.R_OK)
-            writable = os.access(path, os.W_OK)
-            executable = os.access(path, os.X_OK)
-            
-            perms = []
-            if readable: perms.append('R')
-            if writable: perms.append('W')
-            if executable: perms.append('X')
-            
-            perm_str = ''.join(perms) if perms else 'no access'
-            
-            print(f"    {path}: {perm_str}")
-            
-            if writable and 'docker.sock' in path:
-                print(f"        [!!!] DOCKER SOCKET IS WRITABLE!")
-            if writable and '/host' in path:
-                print(f"        [!!!] HOST PATH IS WRITABLE!")
-
-def check_docker_socket():
-    """Детальная проверка Docker socket"""
-    print("\n[*] Checking for Docker socket...")
-    
-    socket_paths = [
-        '/var/run/docker.sock',
-        '/run/docker.sock',
-        '/host/var/run/docker.sock',
-        '/host/run/docker.sock'
-    ]
-    
-    for sock in socket_paths:
-        if os.path.exists(sock):
-            print(f"[+] Docker socket found: {sock}")
-            try:
-                stat_info = os.stat(sock)
-                print(f"    Permissions: {oct(stat_info.st_mode)}")
-                print(f"    UID: {stat_info.st_uid}, GID: {stat_info.st_gid}")
-                
-                if os.access(sock, os.R_OK):
-                    print("    [+] Socket is READABLE")
-                if os.access(sock, os.W_OK):
-                    print("    [!!!] Socket is WRITABLE - ESCAPE POSSIBLE!")
-            except Exception as e:
-                print(f"    Error stating: {e}")
-
-def check_namespaces():
-    """Проверяем namespaces"""
-    print("\n[*] Checking namespaces...")
-    
-    ns_path = '/proc/self/ns'
-    try:
-        namespaces = os.listdir(ns_path)
-        for ns in namespaces:
-            try:
-                link = os.readlink(os.path.join(ns_path, ns))
-                print(f"    {ns}: {link}")
-            except:
-                pass
+        if result.stdout:
+            print(result.stdout)
+        if result.stderr:
+            print(f"[STDERR]: {result.stderr}")
+        
+        return result.returncode, result.stdout, result.stderr
+    except subprocess.TimeoutExpired:
+        print("[!] Command timed out")
+        return -1, "", "timeout"
     except Exception as e:
-        print(f"[-] Error: {e}")
+        print(f"[!] Error: {e}")
+        return -1, "", str(e)
 
-def check_environment():
-    """Проверяем переменные окружения"""
-    print("\n[*] Checking environment variables...")
-    
-    interesting_vars = ['KUBERNETES_', 'DOCKER_', 'HOST', 'PATH', 'HOME', 
-                       'HOSTNAME', 'AWS_', 'GOOGLE_', 'AZURE_']
-    
-    for key, value in os.environ.items():
-        if any(var in key for var in interesting_vars):
-            print(f"    {key}={value[:100]}")
+def check_file(path, description):
+    """Проверяет файл и читает его"""
+    print(f"\n[*] {description}: {path}")
+    print("-" * 60)
+    if os.path.exists(path):
+        print(f"[+] File exists!")
+        try:
+            if os.path.isdir(path):
+                files = os.listdir(path)
+                print(f"    Directory contains {len(files)} items:")
+                for f in files[:20]:
+                    print(f"        {f}")
+                if len(files) > 20:
+                    print(f"        ... and {len(files) - 20} more")
+            else:
+                with open(path, 'r') as f:
+                    content = f.read(4096)
+                    print(content)
+                    if len(content) >= 4096:
+                        print("\n[...truncated...]")
+        except PermissionError:
+            print("[-] Permission denied")
+        except Exception as e:
+            print(f"[-] Error reading: {e}")
+    else:
+        print("[-] File not found")
 
-def check_network():
-    """Сетевая информация"""
-    print("\n[*] Network info...")
-    print(f"    Hostname: {socket.gethostname()}")
+def main():
+    print("="*60)
+    print("CONTAINER PRIVILEGE ESCALATION CHECKER")
+    print("="*60)
     
-    # Проверяем сетевые интерфейсы через /proc
-    net_dev = safe_read('/proc/net/dev')
-    if net_dev:
-        print("    Interfaces:")
-        for line in net_dev.split('\n')[2:]:
-            if ':' in line:
-                iface = line.split(':')[0].strip()
-                if iface:
-                    print(f"        {iface}")
-
-def check_writable_locations():
-    """Ищем места куда можем писать"""
-    print("\n[*] Checking writable locations...")
+    # 1. Проверяем sudo
+    run_cmd("sudo -l", "Checking sudo permissions")
+    run_cmd("sudo -V", "Checking sudo version")
     
-    locations = [
-        '/tmp',
-        '/var/tmp',
-        '/dev/shm',
-        os.path.expanduser('~'),
-        '/home',
-        '/'
-    ]
+    # 2. Проверяем su
+    run_cmd("su -c 'id' 2>&1", "Trying su")
     
-    for loc in locations:
-        if os.path.exists(loc) and os.access(loc, os.W_OK):
-            print(f"    [+] Writable: {loc}")
-            
-            # Проверяем есть ли там что-то интересное
-            if loc in ['/tmp', '/var/tmp', '/dev/shm']:
-                try:
-                    files = os.listdir(loc)
-                    if files:
-                        print(f"        Contains {len(files)} items")
-                except:
-                    pass
-
-def check_proc_info():
-    """Информация из /proc"""
-    print("\n[*] Process information...")
+    # 3. Ищем sudoers
+    check_file("/etc/sudoers", "Checking sudoers")
+    check_file("/etc/sudoers.d", "Checking sudoers.d")
     
-    # cmdline
-    cmdline = safe_read('/proc/self/cmdline', 'rb')
-    if cmdline:
-        cmdline_str = cmdline.replace(b'\x00', b' ').decode('utf-8', errors='ignore')
-        print(f"    Cmdline: {cmdline_str}")
-    
-    # cgroup
-    cgroup = safe_read('/proc/self/cgroup')
-    if cgroup:
-        print("    Cgroups:")
-        for line in cgroup.split('\n')[:5]:
-            if line.strip():
-                print(f"        {line}")
-
-def check_container_runtime_info():
-    """Ищем информацию о runtime"""
-    print("\n[*] Container runtime info...")
-    
-    # Ищем .dockerenv
-    if os.path.exists('/.dockerenv'):
-        dockerenv = safe_read('/.dockerenv')
-        print(f"    /.dockerenv exists (content: {dockerenv if dockerenv else 'empty'})")
-    
-    # hostname file
-    hostname_file = safe_read('/etc/hostname')
-    if hostname_file:
-        print(f"    /etc/hostname: {hostname_file.strip()}")
-    
-    # hosts file
-    hosts = safe_read('/etc/hosts')
-    if hosts:
-        print("    /etc/hosts (first 5 lines):")
-        for line in hosts.split('\n')[:5]:
-            if line.strip():
-                print(f"        {line}")
-
-def check_escape_vectors():
-    """Анализ возможных векторов побега"""
+    # 4. Kubernetes service account
     print("\n" + "="*60)
-    print("[*] POTENTIAL ESCAPE VECTORS (unprivileged):")
+    print("[*] KUBERNETES SERVICE ACCOUNT CHECK")
+    print("="*60)
+    
+    k8s_sa_path = "/var/run/secrets/kubernetes.io/serviceaccount"
+    check_file(k8s_sa_path, "K8s service account directory")
+    check_file(f"{k8s_sa_path}/token", "K8s token")
+    check_file(f"{k8s_sa_path}/namespace", "K8s namespace")
+    check_file(f"{k8s_sa_path}/ca.crt", "K8s CA cert")
+    
+    # 5. Environment variables
+    print("\n" + "="*60)
+    print("[*] KUBERNETES ENVIRONMENT VARIABLES")
+    print("="*60)
+    run_cmd("env | grep -i kubernetes", "K8s env vars")
+    run_cmd("env | grep -i service", "Service env vars")
+    
+    # 6. Проверяем /tmp
+    print("\n" + "="*60)
+    print("[*] CHECKING /tmp CONTENTS")
+    print("="*60)
+    run_cmd("ls -laR /tmp/ 2>/dev/null | head -100", "Listing /tmp")
+    
+    # 7. Процессы
+    print("\n" + "="*60)
+    print("[*] RUNNING PROCESSES")
+    print("="*60)
+    run_cmd("ps aux", "Process list")
+    
+    # 8. Network connectivity
+    print("\n" + "="*60)
+    print("[*] NETWORK CONNECTIVITY")
+    print("="*60)
+    run_cmd("curl --version 2>&1", "Checking curl")
+    run_cmd("wget --version 2>&1 | head -1", "Checking wget")
+    
+    # Проверяем K8s API
+    run_cmd("curl -k https://kubernetes.default.svc 2>&1", "Testing K8s API connectivity")
+    run_cmd("curl -k https://kubernetes.default.svc/api 2>&1", "Testing K8s API /api endpoint")
+    
+    # 9. DNS resolution
+    run_cmd("cat /etc/resolv.conf", "DNS configuration")
+    run_cmd("nslookup kubernetes.default.svc 2>&1 || host kubernetes.default.svc 2>&1", "DNS lookup K8s")
+    
+    # 10. Ищем интересные файлы в home
+    print("\n" + "="*60)
+    print("[*] HOME DIRECTORY EXPLORATION")
+    print("="*60)
+    run_cmd("ls -laR /home/ 2>/dev/null | head -200", "Home directories")
+    
+    # 11. Ищем credentials/secrets
+    print("\n" + "="*60)
+    print("[*] SEARCHING FOR CREDENTIALS")
+    print("="*60)
+    run_cmd("find /home -type f -name '*.key' -o -name '*.pem' -o -name '*credentials*' -o -name '*password*' 2>/dev/null | head -20", "Looking for key files")
+    run_cmd("env | grep -i 'pass\\|key\\|secret\\|token' | grep -v 'KUBERNETES'", "Environment secrets")
+    
+    # 12. Проверяем mounted volumes
+    print("\n" + "="*60)
+    print("[*] ANALYZING MOUNTED VOLUMES")
+    print("="*60)
+    run_cmd("df -h", "Disk usage")
+    run_cmd("mount | grep -v 'proc\\|sys\\|tmpfs' | grep -v 'cgroup'", "Interesting mounts")
+    
+    # 13. Ищем writable paths вне home/tmp
+    print("\n" + "="*60)
+    print("[*] WRITABLE PATHS")
+    print("="*60)
+    run_cmd("find / -writable -type d 2>/dev/null | grep -v -E '(proc|sys|home|tmp|dev)' | head -30", "Writable directories")
+    
+    # 14. Проверяем какие порты открыты
+    print("\n" + "="*60)
+    print("[*] NETWORK PORTS")
+    print("="*60)
+    run_cmd("netstat -tuln 2>/dev/null || ss -tuln 2>/dev/null", "Listening ports")
+    
+    # 15. Kernel info
+    print("\n" + "="*60)
+    print("[*] KERNEL INFORMATION")
+    print("="*60)
+    run_cmd("uname -a", "Kernel version")
+    run_cmd("cat /proc/version", "Kernel details")
+    
+    # 16. Container runtime info
+    print("\n" + "="*60)
+    print("[*] CONTAINER RUNTIME")
+    print("="*60)
+    run_cmd("cat /proc/self/cgroup", "Cgroup info")
+    
+    # 17. Ищем setuid/setgid
+    print("\n" + "="*60)
+    print("[*] SUID/SGID BINARIES ANALYSIS")
+    print("="*60)
+    run_cmd("find /usr/bin /usr/sbin /bin /sbin -perm -4000 2>/dev/null", "SUID binaries")
+    run_cmd("find /usr/bin /usr/sbin /bin /sbin -perm -2000 2>/dev/null", "SGID binaries")
+    
+    # 18. Capabilities на бинарниках
+    print("\n" + "="*60)
+    print("[*] BINARY CAPABILITIES")
+    print("="*60)
+    run_cmd("getcap -r / 2>/dev/null | head -20", "Files with capabilities")
+    
+    # SUMMARY
+    print("\n" + "="*60)
+    print("[*] PRIVILEGE ESCALATION SUMMARY")
     print("="*60)
     
     vectors = []
     
-    # Docker socket
-    docker_sockets = ['/var/run/docker.sock', '/run/docker.sock', 
-                     '/host/var/run/docker.sock']
-    for sock in docker_sockets:
-        if os.path.exists(sock) and os.access(sock, os.W_OK):
-            vectors.append(f"Docker socket writable: {sock} - Mount host filesystem via Docker API")
+    # Проверяем результаты
+    if os.path.exists("/var/run/secrets/kubernetes.io/serviceaccount/token"):
+        vectors.append("[!!!] K8s service account token found - Can communicate with K8s API")
     
-    # Host mounts
-    if os.path.exists('/host') and os.access('/host', os.R_OK):
-        vectors.append("Host filesystem mounted at /host - Read host files")
-        if os.access('/host', os.W_OK):
-            vectors.append("Host filesystem WRITABLE - Write to host")
-    
-    # Kubernetes service account
-    if os.path.exists('/var/run/secrets/kubernetes.io/serviceaccount/token'):
-        vectors.append("Kubernetes service account token present - API access possible")
-    
-    # Writable /etc
-    if os.access('/etc', os.W_OK):
-        vectors.append("Writable /etc - Modify container config")
-    
-    # Environment variables with secrets
-    secret_vars = [k for k in os.environ.keys() if any(x in k.upper() for x in 
-                   ['PASSWORD', 'SECRET', 'TOKEN', 'KEY', 'API'])]
-    if secret_vars:
-        vectors.append(f"Secrets in environment: {', '.join(secret_vars[:3])}")
+    returncode, stdout, _ = run_cmd("sudo -l 2>&1", "Final sudo check", shell=True)
+    if "NOPASSWD" in stdout or "ALL" in stdout:
+        vectors.append("[!!!] Sudo misconfiguration detected")
     
     if vectors:
-        for i, v in enumerate(vectors, 1):
-            print(f"[{i}] {v}")
+        print("\n[+] POTENTIAL PRIVILEGE ESCALATION VECTORS:")
+        for v in vectors:
+            print(f"    {v}")
     else:
-        print("[-] No obvious escape vectors detected from unprivileged user")
-        print("[*] Possible approaches:")
-        print("    - Check for application vulnerabilities")
-        print("    - Look for SUID binaries")
-        print("    - Search for kernel exploits (if writable /proc)")
-        print("    - Try to escalate privileges first")
-        print("    - Check mounted volumes for sensitive data")
-
-def check_suid_binaries():
-    """Ищем SUID бинарники"""
-    print("\n[*] Checking for SUID binaries...")
-    
-    search_paths = ['/usr/bin', '/usr/sbin', '/bin', '/sbin', '/usr/local/bin']
-    suid_found = []
-    
-    for search_path in search_paths:
-        if not os.path.exists(search_path):
-            continue
-        
-        try:
-            for root, dirs, files in os.walk(search_path):
-                for filename in files:
-                    filepath = os.path.join(root, filename)
-                    try:
-                        stat_info = os.stat(filepath)
-                        # Проверяем SUID bit
-                        if stat_info.st_mode & 0o4000:
-                            suid_found.append(filepath)
-                    except:
-                        pass
-                # Не углубляемся слишком
-                if len(suid_found) > 20:
-                    break
-        except:
-            pass
-    
-    if suid_found:
-        print(f"    [+] Found {len(suid_found)} SUID binaries:")
-        for binary in suid_found[:10]:
-            print(f"        {binary}")
-        if len(suid_found) > 10:
-            print(f"        ... and {len(suid_found) - 10} more")
-    else:
-        print("    [-] No SUID binaries found")
-
-def main():
-    print("="*60)
-    print("CONTAINER ESCAPE ANALYZER (Unprivileged)")
-    print("="*60)
-    
-    check_container_type()
-    check_user_context()
-    check_capabilities()
-    check_environment()
-    check_mounts()
-    check_filesystem_access()
-    check_docker_socket()
-    check_namespaces()
-    check_writable_locations()
-    check_proc_info()
-    check_container_runtime_info()
-    check_network()
-    check_suid_binaries()
-    check_escape_vectors()
+        print("\n[-] No obvious privilege escalation vectors found")
+        print("[*] Next steps:")
+        print("    1. Analyze running processes for vulnerabilities")
+        print("    2. Check for kernel exploits")
+        print("    3. Look for application-specific misconfigurations")
+        print("    4. Try to access K8s API if token exists")
     
     print("\n" + "="*60)
     print("[*] Analysis complete")
